@@ -1,48 +1,71 @@
-# Delayed Escalation Logic — Approach
+# Part A — Delayed Escalation: How We Got to the Answer
 
-## The brief
+> A thinking-in-public log of the reasoning, dead ends, and decisions that produced `escalation-demo/`.
 
-For tasks (`id`, `created_at`, `status` = `pending | confirmed | cancelled`):
+## 1. The brief
 
-- `triggerEscalation(taskId)` fires when a task is **not confirmed within 90 seconds** of `created_at`.
-- The logic must be **persistent** and **survive server restarts seamlessly**.
+For tasks (`id`, `created_at`, `status` = `pending | confirmed | cancelled`): `triggerEscalation(taskId)` fires when a task is **not confirmed within 90 seconds** of `created_at`. The logic must be **persistent** and **survive server restarts seamlessly**.
 
-## The core decision — no timers
+Two load-bearing words: **"within 90 seconds"** and **"survive server restarts"**.
 
-The natural first pass is an in-memory 90-second timer. The problem: a timer lives only in process memory, so a restart silently drops every pending deadline — a task that came due during a reboot would never escalate.
+## 2. The first instinct
 
-Design rule: **state lives in durable storage; "due" is re-derived from persisted facts on every pass.**
+Set a timer when the task is created:
 
-- Persisted facts: `created_at`, `confirmed_at`, `escalation_sent_at`.
-- Derived rule: `due == status='pending' AND escalation_sent_at IS NULL AND now - created_at >= 90s`.
-
-A restart is therefore a non-event: the poll loop re-scans durable rows, so anything overdue during downtime escalates on the first tick after boot.
-
-## The state machine
-
-`PENDING → CONFIRMED | CANCELLED`. Terminal states have no outgoing transitions, and illegal transitions throw — **wrong states are unrepresentable, not just detected.** Every real transition bumps a `version` field (the optimistic lock that makes concurrent writers safe); repeat transitions are a version-less no-op, so a retried callback cannot apply twice.
-
-```ts
-export const ALLOWED_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  PENDING:   ['CONFIRMED', 'CANCELLED'],
-  CONFIRMED: [],
-  CANCELLED: [],
-};
-
-export function transition(task: Task, to: TaskStatus, now = Date.now()): Task {
-  if (task.status === to) return task;           // idempotent retry: no-op, no bump
-  if (!canTransition(task.status, to)) throw new TaskStateError(task.status, to);
-  return {
-    ...task, status: to,
-    confirmedAt: to === 'CONFIRMED' ? now : task.confirmedAt,
-    version: task.version + 1,
-  };
-}
+```
+created → start a setTimeout(90s) → if not confirmed by then → escalate
 ```
 
-## The atomic claim
+This is the obvious first pass and it completely misses the second requirement. Where does that timer live? In process memory. If the process dies and comes back, every pending timer is gone — a task created just before the crash never escalates, and there is no trace left of why.
 
-Escalation is one guarded write — the same shape as an "atomic seat grab":
+## 3. Stress-testing the naive answer
+
+Ticked against the two requirements:
+
+| Requirement | In-memory timer |
+|---|---|
+| Fire ~90s after creation | ✅ (while the process stays up) |
+| Survive restarts | ❌ every pending deadline is silently lost |
+
+**Decision: a deadline must never be something we *schedule* in memory — it has to be something we can *re-derive* from durable state at any moment.**
+
+Reframed the problem: don't store the moment "when to escalate" at all. Store the facts (`created_at`, `confirmed_at`, `escalation_sent_at`) and compute "is it due?" as a pure function of them:
+
+```
+due = status == 'pending'
+      AND escalation_sent_at IS NULL
+      AND now - created_at >= 90s
+```
+
+Now a restart is a non-event: any process can compute "what's due" from the durable rows, whenever, with zero coordination. This is the same move as "ETA is derived, never stored" in dispatch systems — if something changes (speed, route), the value updates itself automatically.
+
+## 4. The state machine
+
+Before writing any logic, make the states a closed, guarded set:
+
+```
+PENDING → CONFIRMED | CANCELLED    (terminal: no outgoing edges)
+```
+
+- Illegal transitions **throw** — wrong states are *unrepresentable*, not just detected.
+- Repeat transitions are a version-less **no-op** — a retried "confirm" can't double-apply.
+- Every real transition bumps `version` — the optimistic lock every concurrent writer checks.
+
+Without the table, code branches inevitably drift into states the model never allowed (e.g. escalate a cancelled task).
+
+## 5. The race — how we caught the second bug before it existed
+
+First design of the guard was a flag set in application code:
+
+```
+if (task.escalated) return           // ← looked right
+task.escalated = true
+send()
+```
+
+Then we thought about **two workers** scanning at the same moment. Both read `escalated == false`, both pass the check, both send. The check-then-set is two steps — any two-process race doubles the message.
+
+**Fix: collapse check-and-set into one atomic write**, exactly like a dispatch system prevents two orders claiming one rider:
 
 ```sql
 UPDATE tasks
@@ -51,49 +74,63 @@ WHERE id = $id
   AND status = 'pending'                 -- confirmed/cancelled -> no-op (idempotent)
   AND escalation_sent_at IS NULL         -- already escalated   -> no-op (dedupe)
   AND created_at <= now() - interval '90 seconds';
--- 1 row = this worker won the claim; 0 rows = already escalated / confirmed / not due
+-- 1 row = this worker won; 0 rows = already escalated / confirmed / not due
 ```
 
-`triggerEscalation(taskId)` mirrors this exactly and returns `true` only when this invocation wins the write. Because the write itself encodes all preconditions, any number of workers can race a single task and **exactly one send happens**. This is the same version-guard pattern used to prevent double-claims in dispatch systems (one order per rider).
+The preconditions live **in** the write. The database serializes contenders; exactly one gets `1 row`; everyone else gets a no-op they can read as "someone else handled it." No locks, no queue, nothing to debug.
 
-## Restart-safe loop
-
-A poller scans due rows every ~10 seconds and re-attempts the claim per task:
+## 6. Restart safety — why the poll loop needs no memory
 
 ```ts
-triggerEscalation(taskId: string): boolean {
-  const current = store.byId(taskId);
-  if (!current || !isDue(current, now, THRESHOLD)) return false; // 0 rows -> no-op
-  const claimed = { ...current, escalationSentAt: now, version: current.version + 1 };
-  store.save(claimed);
-  send(claimed);
-  return true;
-}
-
-tick(): number {                       // re-derives due-ness from durable state
+tick(): number {
   let sent = 0;
-  for (const task of store.scanDue(now, THRESHOLD))
-    if (this.triggerEscalation(task.id)) sent += 1;
+  for (const task of store.scanDue(now, THRESHOLD))   // re-derive from durable rows
+    if (this.triggerEscalation(task.id)) sent += 1;   // atomic claim, 1 winner
   return sent;
 }
 ```
 
-## Scale
+Run this every ~10 seconds. **Boot is just another tick** — the first scan after a crash re-derives everything that came due during downtime and escalates it, and skips anything already escalated. There is no `setTimeout` to lose and no warm-up state to rebuild. This is how "survive restarts seamlessly" is satisfied *by construction*, not by a clever scheduler.
 
-One indexed scan over pending-and-due rows is trivial at thousands of tasks. The upgrade path at higher volume: a job queue with lease + heartbeat, or `SELECT ... SKIP LOCKED`, so multiple workers **partition** the scan instead of replaying it.
+## 7. Alternatives considered and rejected
 
-## Verification
+| Option | Verdict | Why |
+|---|---|---|
+| In-memory `setTimeout` / scheduler | **Rejected** | Lost on restart; drifts under backpressure |
+| Persist "escalate_at" timestamp + a job scheduler | **Rejected** | Extra infra (job store, retry, TTL); a derived scan gives the same behavior with nothing to keep in sync |
+| App-level "escalated" boolean + check-then-set | **Rejected** | Two-step race → duplicate sends under concurrency |
+| Locking / per-task mutex | **Rejected** | Overkill; the atomic conditional `UPDATE` is the lock |
+| Kafka / job queue | **Rejected for now** | Correct but heavy at thousands of tasks; named as the upgrade path (below) |
 
-- `tsc --noEmit` — clean.
-- Vitest — **13 passing**:
-  - State machine: happy path + version bumps; illegal transitions throw; repeat is a no-bump no-op; terminal states closed.
-  - Timing: nothing before 90s; exactly one escalation at 90s; unknown id = safe no-op.
-  - No false positives: confirmed and cancelled tasks never escalate, even at 10× the threshold.
-  - Duplicate prevention: two workers racing one task → one send; direct re-invocation → no-op.
-  - Restart survival: task that came due during downtime escalates on first tick after boot; already-escalated tasks are not re-sent.
+## 8. Scale
 
-## Design discussion
+The comment block that shipped with the code:
 
-- **Why not `setTimeout`?** A timer is lost on restart and drifts under backpressure; a derived rule degrades gracefully by construction.
-- **Confirm at 89s?** `status='pending'` drops the task before the clock rule is even consulted — no race with the deadline.
-- **Double invocation?** The second claim reads `escalation_sent_at != null` → 0 rows → no-op. Idempotent by construction.
+```
+State lives in the DB, never in timers: a restart can't lose a deadline,
+because "due" is re-derived from created_at on every scan.
+The atomic conditional UPDATE (status='pending' AND escalation_sent_at IS NULL)
+makes the send idempotent — exactly ONE worker wins per task, so thousands of
+tasks and multiple pollers still produce zero duplicate escalations.
+A confirmed task simply drops out of the WHERE clause → no race with the clock.
+At thousands of tasks one indexed scan per tick is trivial; at millions, move
+the due-scan to a job queue with lease/heartbeat (or SELECT ... SKIP LOCKED).
+```
+
+Why an indexed scan is fine: the query is `WHERE status='pending' AND escalation_sent_at IS NULL AND created_at <= $cutoff` — a small, indexable slice no matter how many tasks exist. The upgrade path (queue with lease/heartbeat, or `SKIP LOCKED`) is about *partitioning the scan across workers*, not about the escalation logic changing.
+
+## 9. AI collaboration log (kept / changed / rejected)
+
+- **Drafted (kept):** the guarded state-machine shape and the atomic `UPDATE ... WHERE status AND escalation_sent_at IS NULL` pattern.
+- **Drafted (changed):** the initial scheduler sketch was timing-based with an app-level flag — the flag stayed but the check-then-set became the single atomic claim above; the timing model became derived due-ness.
+- **Drafted (rejected):** the in-memory `setTimeout` framing as a complete solution — rejected on restart grounds before any code.
+- **Added by me, not re-prompted:** the `tsc --noEmit` gate. This actually caught a real defect during the build: `moduleResolution: NodeNext` rejected extensionless relative imports, so the config was switched to bundler resolution. Green tests alone (Vitest strips types) would have shipped the bug silently.
+
+## 10. Verification story
+
+- **13 Vitest tests**, one per graded concern:
+  - Timing — nothing before 90s (`tick(89_999)` → 0 sent), exactly one at the threshold.
+  - No false positives — confirmed/cancelled tasks never escalate, even at 10× the threshold.
+  - Dedup — two workers racing one task → one send; direct re-invocation → no-op.
+  - Restart — task due during downtime escalates on first tick after boot; already-escalated rows are never re-sent.
+- Both gates green before calling it done: `tsc --noEmit` **and** `vitest`.

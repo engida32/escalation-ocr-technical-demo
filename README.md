@@ -9,6 +9,8 @@ A two-part full-stack technical challenge, solved with verified code and a writt
 | **A — Delayed Escalation** | Restart-safe "escalate a task if it isn't confirmed within 90s", so no timer is lost and no duplicate send happens. | `escalation-demo/` (TS + Vitest, passing) · `approach/part-a-delayed-escalation.md` |
 | **B — Noisy Input → Structured JSON** | Noisy OCR / photos of menus and business signs → clean, validated JSON (`menu` and `listing` shapes). | `approach/part-b-noisy-ocr-to-json.md` |
 
+The `approach/` docs are **thought-process journals** — first instinct, what broke, alternatives rejected and why, the AI keep/changed/rejected log, and the verification story for each part.
+
 ## Quick start (Part A)
 
 ```bash
