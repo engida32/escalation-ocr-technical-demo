@@ -128,7 +128,7 @@ Why an indexed scan is fine: the query is `WHERE status='pending' AND escalation
 
 ## 10. Verification story
 
-- **13 Vitest tests**, one per graded concern:
+- **13 Vitest tests**, one per core concern:
   - Timing — nothing before 90s (`tick(89_999)` → 0 sent), exactly one at the threshold.
   - No false positives — confirmed/cancelled tasks never escalate, even at 10× the threshold.
   - Dedup — two workers racing one task → one send; direct re-invocation → no-op.
